@@ -34,7 +34,7 @@ The `create()` function, reproduced below, initializes a `struct Machine` and fi
 +---------------+
 | main_func     |   A pointer to the machine_main_demo() function
 +---------------+
-| arg           |   Arguments to the function, 1 by default
+| arg           |   Return value of function, 1 by default
 +---------------+
 | state         |   STATE_UNUSED, STATE_INITIALIZED, STATE_RUNNING, or STATE_EXITED
 +---------------+
@@ -47,6 +47,8 @@ The `create()` function, reproduced below, initializes a `struct Machine` and fi
 ```
 
 After creating a machine, we can start running it with the `start()` function. This function forks a child process for the machine, fills in the machine‘s PID and changes its state to `STATE_RUNNING`, and sets up bidirectional communication with parent process using the pipes. Once setup is complete, the machine calls its `main_func`, which by default is the `machine_main_demo()` function reproduced below.
+
+`machine_main_demo()` allows the factory (parent) and machine (child) to communicate. Using a custom reading function, it loops infinitely until it receives a message other than `ping`, to which it responds `pong`. Once it receives a different message, it either returns 0 if it read `exit`, returns the machine’s `arg` if it read `fail`, or else echoes that message back and loops again.
 
 ```
 int machine_main_demo(Machine *machine, void *arg)
@@ -184,13 +186,70 @@ This function is called by both the parent (in `cli_recv()`) and the child (in `
 ## Exploit
 The buffer passed to `read_line_fd()` from the machine is stack allocated in `machine_main_demo()`, so we can deterministically write past it to reach the return address saved on the stack and overwrite whither we return.
 
-Since our ultimate goal is to get the flag from the `flag.txt` file, we must find a sequence of commands to open the file, read its contents, and print the flag. We can see from the symbol table that the `open()` function is imported at offset `0x38a40` from the start of the executable, and we have the option of `read()` or `read_line_fd()` to read the flag.
+Since our ultimate goal is to get the flag from the `flag.txt` file, we must find a sequence of commands to open the file, read its contents, and print the flag. We can see from the symbol table that the `open()` function is imported at offset `0x38a40` from the start of the executable, and we have the option of `read()` or `read_line_fd()` to read the flag (entries highlighted in symbol table shown below).
 
-Because the program’s stack is not executable (seen through `readelf -l`), we cannot directly execute shellcode to run these functions. Instead, we can use existing instruction sequences from the programmer’s `.text` section, which is executable, to build an ROP chain and execute our own commands. The binary has sequences to pop a value into `rdi` at `0xc028` (`5f 5d c3`) and into `rsi` at `0x15bc7` (`5e 5d c3`). However, there is no gadget which would give us `rdx` (`5a 5d c3`), so we have to use the two-argument `read_line_fd()` rather than the three-argument `read()`. We will also use a `ret` instruction from `0xa382` to align the stack before calling our functions.
+![Symbol table](./symbol-table.png)
+
+Because the program’s stack is not executable (seen through `readelf -l`), we cannot directly execute shellcode to run these functions. Instead, we can use existing instruction sequences from the programmer’s `.text` section, which is executable, to build an ROP chain and execute our own commands.
+
+The binary has sequences to pop a value into `rdi` at `0xc028` (`5f 5d c3`) and into `rsi` at `0x15bc7` (`5e 5d c3`). However, there is no gadget which would give us `rdx` (`5a 5d c3`), which prevents us from calling a function that needs `rdx` to pass a third argument. This means that instead of calling `read`, we must use the `read_line_fd()`, which only takes two arguments: the input stream and the buffer. We will also use a `ret` instruction from `0xa382` to align the stack before calling our functions.
 
 The reading function we are using takes a file descriptor as its first argument, so we choose to send our message from the terminal as the parent and read from the child’s pipe. We see in the `machine_start()` function that this set of pipes is created first, so we can guess the read end will have FD 3. We first have to write the filepath to memory, then open it, then read the file from the opened FD into a memory region, then print it. For simplicity and availability, we will do this print with `puts()`, found at offset `0x15fc0`.
 
 We can write the filename and flag contents into two “buffers” in the `.bss` section, which has write permissions. The only requirements are that these regions do not contain `\n` characters, as these would cause `read_line_fd()` to stop reading prematurely.
+
+Here is a more comprehensive overview of the ROP chain we assemble.
+```
+Read filepath from pipe: read_line_fd(CHILD_FD, filename_region)
+-----------------------------------------------------------------------
+|PIE base + 0xc028: the gadget to pop the first argument into rdi      |
+|3: the child file descriptor, which will go into rdi                  |
+|0: to align instruction                                               |
+|                                                                      |
+|PIE base + 0x15bc7: the gadget to pop the second argument into rsi    |
+|<address>: the region found in the .bss section to write the filename |
+|0: to align instruction                                               |
+|                                                                      |
+|PIE base + 0x9f9f: the read_line_fd function to call                  |
+-----------------------------------------------------------------------
+
+Open the flag file for reading: open(filename_region, 0)
+-----------------------------------------------------------------------
+|PIE base + 0xc028: the gadget to pop the first argument into rdi      |
+|<address>: the region found in the .bss section to write the filename |
+|0: to align instruction                                               |
+|                                                                      |
+|PIE base + 0x15bc7: the gadget to pop the second argument into rsi    |
+|<address>: null flags argument put into rsi                           |
+|0: to align instruction                                               |
+|                                                                      |
+|PIE base + 0x38a40: the open function to call                         |
+-----------------------------------------------------------------------
+
+Read flag from file: read_line_fd(FLAG_FD, flag_region)
+-----------------------------------------------------------------------
+|PIE base + 0xc028: the gadget to pop the first argument into rdi      |
+|3: the flag file descriptor, which will go into rdi                   |
+|0: to align instruction                                               |
+|                                                                      |
+|PIE base + 0x15bc7: the gadget to pop the second argument into rsi    |
+|<address>: the region found in the .bss section to write the flag     |
+|0: to align instruction                                               |
+|                                                                      |
+|PIE base + 0x9f9f: the read_line_fd function to call                  |
+-----------------------------------------------------------------------
+
+Print the flag: puts(flag_region)
+-----------------------------------------------------------------------
+|PIE base + 0xa382: the ret gadget to align the call                   |
+|                                                                      |
+|PIE base + 0xc028: the gadget to pop the first argument into rdi      |
+|3: the flag file descriptor, which will go into rdi                   |
+|0: to align instruction                                               |
+|                                                                      |
+|PIE base + 0x15fc0: the puts function to call                         |
+-----------------------------------------------------------------------
+```
 
 The only remaining obstacle is to find the runtime addresses of all these functions by leaking the PIE base of the program. This can be done with the functionality described in `machine_monitor()`. The monitoring function only reports success if the machine exited with status 0, so if we find an `exit` instruction in the disassembly, we can brute-force guess its runtime address until we get a successful exit. Otherwise, the machine will be restarted by `machine_monitor()` and we can guess again. Such an `exit` instruction is found at `0x10b459`.
 
@@ -202,7 +261,7 @@ With these factors, we can solve the challenge using a script with the following
 4. Build the ROP chain with the known runtime addresses of the necessary instructions and functions.
 5. Send a command from the parent to execute the ROP chain and get the flag.
 
-This script, `exploit.py`, gets the flag:
+The attached script, [`exploit.py`](./exploit.py), gets the flag:
 ```
 UMASS{AsLR_L3Ak}
 ```
